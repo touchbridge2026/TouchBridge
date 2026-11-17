@@ -1,0 +1,90 @@
+# Paper Table IV. Additional solver controls are documented in docs/method.md.
+# Hand-base regularizers remain; the tactile graph contains no base nodes.
+# Compliance uses sensor-origin -> patch-center direction (+1).
+expected_dof_per_hand: 20
+mapping:
+  mode: relative_initial
+  hand_scale_left: 1.0
+  hand_scale_right: 1.0
+  left_robot_wrist_init_to_cam: null
+  right_robot_wrist_init_to_cam: null
+tactile:
+  contact_threshold: 0.02
+  active_taxel_force_threshold: 0.01
+  min_active_taxels: 2
+  smooth_contact_window: 3
+  eps: 1.0e-08
+tactile_visualization:
+  active_taxel_force_threshold: 0.02
+  patch_center_min_total_force: 0.05
+  patch_center_min_active_taxels: 2
+  active_taxel_colormap: yellow_to_red
+  inactive_taxel_color:
+  - 0.2
+  - 0.4
+  - 1.0
+  patch_center_color:
+  - 0.0
+  - 1.0
+  - 0.2
+  patch_center_radius: 0.008
+optimization:
+  fast_cpu_math: true
+  max_iters: 160
+  verbose: 2
+  lambda_base_anchor_pos: 0.1
+  lambda_base_anchor_rot: 0.03
+  lambda_base_step_pos: 0.06
+  lambda_base_step_rot: 0.05
+  lambda_tip_global: 100.0
+  lambda_tip_local: 0.4
+  lambda_tip_rot: 1.0
+  contact_tip_tracking_scale: 0.05
+  contact_hold_frames: 3
+  enable_tip_rot: true
+  finger_weights:
+    thumb: 1.0
+    index: 1.0
+    middle: 1.0
+    ring: 1.0
+    pinky: 1.0
+  left_finger_weights:
+    thumb: 1.0
+    index: 1.0
+    middle: 1.0
+    ring: 1.0
+    pinky: 1.0
+  right_finger_weights:
+    thumb: 1.0
+    index: 1.0
+    middle: 1.0
+    ring: 1.0
+    pinky: 1.0
+  lambda_patch: 20.0
+  lambda_taxel_cloud: 4.0
+  lambda_compliance_target: 16.0
+  compliance_stiffness: 20.0
+  compliance_max_depth: 0.01
+  compliance_min_force: 0.0
+  compliance_force_direction_sign: 1.0
+  lambda_tactile_lap: 1.0
+  lambda_cross_hand: 0.4
+  lambda_pair_dist: 0.25
+  lambda_finger_collision: 0.05
+  lambda_joint_rest: 0.005
+  lambda_joint_smooth: 0.45
+  lambda_base_pos_smooth: 10.0
+  lambda_base_rot_smooth: 5.0
+  lambda_base_acc: 0.08
+  lambda_joint_acc: 0.08
+  beta_base: 1.0
+  beta_contact: 2.0
+  d_min: 0.01
+  kappa: 20.0
+  tactile_gamma: 1.0
+  rotvec_bound: 12.566370614359172
+visualization:
+  pointcloud_stride: 4
+  max_depth: 3.0
+  show_mesh_default: true
+  show_skeleton_default: true

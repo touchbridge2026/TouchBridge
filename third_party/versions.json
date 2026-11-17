@@ -1,0 +1,15 @@
+{
+  "sam2": {
+    "url": "https://github.com/facebookresearch/sam2.git",
+    "commit": "2b90b9f5ceec907a1c18123530e92e794ad901a4"
+  },
+  "sam3": {
+    "url": "https://github.com/facebookresearch/sam3.git",
+    "commit": "86ed77094094e5cabb16b0414ec60c5ba9ce0a0f"
+  },
+  "ProPainter": {
+    "url": "https://github.com/sczhou/ProPainter.git",
+    "commit": "e870e79321c31b733e2031af5aa2fb1fe3ac7eec",
+    "patch": "third_party/patches/propainter-zarr.patch"
+  }
+}

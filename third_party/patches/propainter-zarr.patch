@@ -1,0 +1,898 @@
+diff --git a/inference_propainter.py b/inference_propainter.py
+index 4d7f92f..a99496f 100644
+--- a/inference_propainter.py
++++ b/inference_propainter.py
+@@ -3,6 +3,8 @@ import os
+ import cv2
+ import argparse
+ import imageio
++import shutil
++import tempfile
+ import numpy as np
+ import scipy.ndimage
+ from PIL import Image
+@@ -15,13 +17,14 @@ from model.modules.flow_comp_raft import RAFT_bi
+ from model.recurrent_flow_completion import RecurrentFlowCompleteNet
+ from model.propainter import InpaintGenerator
+ from utils.download_util import load_file_from_url
+-from core.utils import to_tensors
+ from model.misc import get_device
+ 
+ import warnings
+ warnings.filterwarnings("ignore")
+ 
+ pretrain_model_url = 'https://github.com/sczhou/ProPainter/releases/download/v0.1.0/'
++SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
++DEFAULT_WEIGHTS_DIR = os.path.join(SCRIPT_DIR, 'weights')
+ 
+ def imwrite(img, file_path, params=None, auto_mkdir=True):
+     if auto_mkdir:
+@@ -30,6 +33,99 @@ def imwrite(img, file_path, params=None, auto_mkdir=True):
+     return cv2.imwrite(file_path, img, params)
+ 
+ 
++def write_mp4_rgb(path, frames, fps):
++    """
++    保存 RGB uint8 帧为 mp4（稳定版）：
++    - 只用 OpenCV VideoWriter，避免 imageio 插件误判导致损坏
++    - 自动保证输出尺寸为偶数（很多 mp4 编码器对奇数尺寸兼容差）
++    """
++    frames = [np.asarray(f).astype(np.uint8) for f in frames]
++    if not frames:
++        return
++
++    h, w = frames[0].shape[:2]
++    out_w = w - (w % 2)
++    out_h = h - (h % 2)
++    if out_w <= 0 or out_h <= 0:
++        raise ValueError(f"Invalid frame size: {(w, h)}")
++
++    proc = []
++    for fr in frames:
++        if fr.shape[:2] != (h, w):
++            fr = cv2.resize(fr, (w, h), interpolation=cv2.INTER_LINEAR)
++        if (out_w, out_h) != (w, h):
++            fr = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
++        proc.append(fr)
++
++    fps = max(1.0, float(fps))
++    candidates = ["mp4v", "avc1", "H264", "XVID"]
++    vw = None
++    for cc in candidates:
++        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*cc), fps, (out_w, out_h))
++        if writer.isOpened():
++            vw = writer
++            break
++        writer.release()
++    if vw is None:
++        raise RuntimeError(f"Failed to open VideoWriter for {path}")
++
++    for fr in proc:
++        vw.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
++    vw.release()
++
++
++def save_png_sequence_rgb(frames, output_dir):
++    os.makedirs(output_dir, exist_ok=True)
++    for idx, fr in enumerate(frames):
++        f = np.asarray(fr).astype(np.uint8)
++        out = os.path.join(output_dir, f"{idx:05d}.png")
++        cv2.imwrite(out, cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
++
++
++def resolve_ckpt_path(weights_dir, filename):
++    """
++    优先使用本地权重；若不存在再尝试下载。
++    """
++    local_path = os.path.join(weights_dir, filename)
++    if os.path.isfile(local_path):
++        print(f"[weights] use local: {local_path}")
++        return local_path
++    print(f"[weights] local missing, try download: {filename}")
++    return load_file_from_url(
++        url=os.path.join(pretrain_model_url, filename),
++        model_dir=weights_dir,
++        progress=True,
++        file_name=filename,
++    )
++
++
++def write_frame_back_to_zarr(zarr_path, frame_idx, rgb_frame, mask_frame,
++                             rgb_key='inpaint_rgb', mask_key='inpaint_mask',
++                             overwrite_rgb=False):
++    """Write one frame result back to zarr/data/frame_xxxxx."""
++    import zarr
++
++    root = zarr.open(zarr_path, mode='a')
++    data = root['data']
++    fkey = f'frame_{frame_idx:05d}'
++    if fkey not in data:
++        return
++    grp = data[fkey]
++
++    rgb = np.asarray(rgb_frame).astype(np.uint8)
++    msk = (np.asarray(mask_frame) > 0).astype(np.uint8)
++
++    if overwrite_rgb:
++        if 'rgb' in grp and tuple(grp['rgb'].shape) == tuple(rgb.shape):
++            grp['rgb'][:] = rgb
++        else:
++            grp.array('rgb', data=rgb, overwrite=True)
++    else:
++        grp.array(rgb_key, data=rgb, overwrite=True)
++
++    grp.array(mask_key, data=msk, overwrite=True)
++
++
+ # resize frames
+ def resize_frames(frames, size=None):    
+     if size is not None:
+@@ -67,6 +163,31 @@ def read_frame_from_videos(frame_root):
+     return frames, fps, size, video_name
+ 
+ 
++def read_frame_from_zarr(zarr_path):
++    """Read RGB frames from aligned zarr: data/frame_xxxxx/rgb."""
++    import zarr
++
++    root = zarr.open(zarr_path, mode='r')
++    if 'data' not in root:
++        raise KeyError(f"'data' group not found in zarr: {zarr_path}")
++    data = root['data']
++    frame_keys = sorted(list(data.keys()))
++    if len(frame_keys) == 0:
++        raise ValueError(f"No frames found under zarr/data: {zarr_path}")
++
++    frames = []
++    for fk in frame_keys:
++        if 'rgb' not in data[fk]:
++            raise KeyError(f"'rgb' not found in {fk} of zarr: {zarr_path}")
++        rgb = data[fk]['rgb'][:].astype(np.uint8)
++        frames.append(Image.fromarray(rgb))
++
++    fps = None
++    size = frames[0].size
++    video_name = os.path.splitext(os.path.basename(zarr_path.rstrip('/')))[0]
++    return frames, fps, size, video_name
++
++
+ def binary_mask(mask, th=0.1):
+     mask[mask>th] = 1
+     mask[mask<=th] = 0
+@@ -114,6 +235,50 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
+     return flow_masks, masks_dilated
+ 
+ 
++def read_mask_from_npz(npz_path, length, size, flow_mask_dilates=8, mask_dilates=5, key='masks'):
++    """
++    Read frame-wise masks from npz, expects bool/0-1 array:
++      - (T, H, W) or
++      - (H, W) (will be repeated to match `length`)
++    """
++    obj = np.load(npz_path)
++    if key not in obj:
++        raise KeyError(f"Key '{key}' not found in npz: {npz_path}, available={obj.files}")
++
++    arr = obj[key]
++    if arr.ndim == 2:
++        arr = np.repeat(arr[None, ...], length, axis=0)
++    elif arr.ndim != 3:
++        raise ValueError(f"Unsupported mask shape {arr.shape} in {npz_path}")
++
++    if arr.shape[0] != length:
++        raise ValueError(
++            f"Mask length mismatch: npz has {arr.shape[0]} frames but video has {length} frames"
++        )
++
++    flow_masks = []
++    masks_dilated = []
++    for i in range(length):
++        mask_np = arr[i]
++        if size is not None:
++            mask_np = cv2.resize(mask_np.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST)
++        mask_np = (mask_np > 0).astype(np.uint8)
++
++        if flow_mask_dilates > 0:
++            flow_mask_img = scipy.ndimage.binary_dilation(mask_np, iterations=flow_mask_dilates).astype(np.uint8)
++        else:
++            flow_mask_img = mask_np
++        flow_masks.append(Image.fromarray(flow_mask_img * 255))
++
++        if mask_dilates > 0:
++            mask_d = scipy.ndimage.binary_dilation(mask_np, iterations=mask_dilates).astype(np.uint8)
++        else:
++            mask_d = mask_np
++        masks_dilated.append(Image.fromarray(mask_d * 255))
++
++    return flow_masks, masks_dilated
++
++
+ def extrapolation(video_ori, scale):
+     """Prepares the data for video outpainting.
+     """
+@@ -173,6 +338,58 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
+     return ref_index
+ 
+ 
++def open_temporal_memmap(cache_dir, name, shape, dtype):
++    """Create a disk-backed array for a full video timeline."""
++    return np.lib.format.open_memmap(
++        os.path.join(cache_dir, f"{name}.npy"),
++        mode="w+",
++        dtype=dtype,
++        shape=shape,
++    )
++
++
++def cache_to_device(cache, indices, device, dtype):
++    """Copy only the requested timeline entries from disk to the inference device."""
++    array = np.array(cache[indices], copy=True)
++    return torch.from_numpy(array).to(device=device, dtype=dtype)
++
++
++def source_frames_to_device(source_cache, start, end, device):
++    """Load RGB frames with the same CPU normalization order as the original code."""
++    frames = np.array(source_cache[start:end], copy=True)
++    frames = torch.from_numpy(frames).permute(0, 3, 1, 2).unsqueeze(0)
++    frames = frames.float().div_(255.0).mul_(2.0).sub_(1.0)
++    return frames.to(device=device)
++
++
++def masks_to_device(mask_cache, indices, device, dtype):
++    """Load uint8 0/255 masks in the tensor layout expected by ProPainter."""
++    masks = cache_to_device(mask_cache, indices, device, dtype)
++    return masks.unsqueeze(0).div_(255.0)
++
++
++def estimate_temporal_cache_bytes(video_length, img_h, img_w, tensor_dtype):
++    """Estimate temporary storage for source data and all timeline intermediates."""
++    tensor_size = np.dtype(tensor_dtype).itemsize
++    source_bytes = video_length * img_h * img_w * 3
++    mask_bytes = video_length * img_h * img_w * 2
++    flow_bytes = max(0, video_length - 1) * 2 * img_h * img_w * tensor_size * 4
++    propagated_bytes = video_length * img_h * img_w * tensor_size * 4
++    return source_bytes + mask_bytes + flow_bytes + propagated_bytes
++
++
++def ensure_temporal_cache_space(cache_dir, required_bytes):
++    """Fail before inference when the temporary filesystem cannot hold all stages."""
++    available_bytes = shutil.disk_usage(cache_dir).free
++    required_with_margin = int(required_bytes * 1.15)
++    if available_bytes < required_with_margin:
++        raise RuntimeError(
++            "临时时间片缓存空间不足："
++            f"需要至少 {required_with_margin / (1024 ** 3):.1f} GiB，"
++            f"当前可用 {available_bytes / (1024 ** 3):.1f} GiB。"
++        )
++
++
+ 
+ if __name__ == '__main__':
+     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+@@ -188,9 +405,9 @@ if __name__ == '__main__':
+     parser.add_argument(
+         "--resize_ratio", type=float, default=1.0, help='Resize scale for processing video.')
+     parser.add_argument(
+-        '--height', type=int, default=-1, help='Height of the processing video.')
++        '--height', type=int, default=480, help='Height of the processing video.')
+     parser.add_argument(
+-        '--width', type=int, default=-1, help='Width of the processing video.')
++        '--width', type=int, default=640, help='Width of the processing video.')
+     parser.add_argument(
+         '--mask_dilation', type=int, default=4, help='Mask dilation for video and flow masking.')
+     parser.add_argument(
+@@ -208,20 +425,50 @@ if __name__ == '__main__':
+     parser.add_argument(
+         '--scale_w', type=float, default=1.2, help='Outpainting scale of width for video_outpainting mode.')
+     parser.add_argument(
+-        '--save_fps', type=int, default=24, help='Frame per second. Default: 24')
++        '--save_fps', type=int, default=30, help='Frame per second. Default: 30')
+     parser.add_argument(
+         '--save_frames', action='store_true', help='Save output frames. Default: False')
+     parser.add_argument(
+-        '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
++        '--fp16', default=False, action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
++    parser.add_argument(
++        '--zarr-rgb', type=str, default=None,
++        help='Optional zarr path. Read RGB from data/frame_xxxxx/rgb (override --video).')
++    parser.add_argument(
++        '--npz-mask', type=str, default=None,
++        help='Optional npz path. Read masks from key "masks" (override --mask).')
++    parser.add_argument(
++        '--weights-dir', type=str, default=DEFAULT_WEIGHTS_DIR,
++        help='Directory containing local checkpoints (default: ProPainter/weights).')
++    parser.add_argument(
++        '--rewrite-zarr', action='store_true',
++        help='Write mask + inpainted RGB back into zarr frame groups.')
++    parser.add_argument(
++        '--rewrite-rgb-key', type=str, default='inpaint_rgb',
++        help='Target key name in each frame group when writing inpaint RGB.')
++    parser.add_argument(
++        '--rewrite-mask-key', type=str, default='inpaint_mask',
++        help='Target key name in each frame group when writing inpaint mask.')
++    parser.add_argument(
++        '--overwrite-rgb', action='store_true',
++        help='Overwrite existing frame rgb (requires shape match).')
+ 
+     args = parser.parse_args()
++    args.weights_dir = os.path.abspath(args.weights_dir)
++    os.makedirs(args.weights_dir, exist_ok=True)
++    if args.rewrite_zarr and args.zarr_rgb is None and not args.video.endswith('.zarr'):
++        raise ValueError('--rewrite-zarr requires --zarr-rgb (or --video *.zarr)')
+ 
+     # Use fp16 precision during inference to reduce running memory cost
+     use_half = True if args.fp16 else False 
+     if device == torch.device('cpu'):
+         use_half = False
+ 
+-    frames, fps, size, video_name = read_frame_from_videos(args.video)
++    if args.zarr_rgb is not None:
++        frames, fps, size, video_name = read_frame_from_zarr(args.zarr_rgb)
++    elif args.video.endswith('.zarr'):
++        frames, fps, size, video_name = read_frame_from_zarr(args.video)
++    else:
++        frames, fps, size, video_name = read_frame_from_videos(args.video)
+     if not args.width == -1 and not args.height == -1:
+         size = (args.width, args.height)
+     if not args.resize_ratio == 1.0:
+@@ -236,9 +483,22 @@ if __name__ == '__main__':
+ 
+     if args.mode == 'video_inpainting':
+         frames_len = len(frames)
+-        flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
+-                                              flow_mask_dilates=args.mask_dilation,
+-                                              mask_dilates=args.mask_dilation)
++        if args.npz_mask is not None:
++            flow_masks, masks_dilated = read_mask_from_npz(
++                args.npz_mask, frames_len, size,
++                flow_mask_dilates=args.mask_dilation,
++                mask_dilates=args.mask_dilation
++            )
++        elif args.mask.endswith('.npz'):
++            flow_masks, masks_dilated = read_mask_from_npz(
++                args.mask, frames_len, size,
++                flow_mask_dilates=args.mask_dilation,
++                mask_dilates=args.mask_dilation
++            )
++        else:
++            flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
++                                                  flow_mask_dilates=args.mask_dilation,
++                                                  mask_dilates=args.mask_dilation)
+         w, h = size
+     elif args.mode == 'video_outpainting':
+         assert args.scale_h is not None and args.scale_w is not None, 'Please provide a outpainting scale (s_h, s_w).'
+@@ -247,230 +507,331 @@ if __name__ == '__main__':
+     else:
+         raise NotImplementedError
+     
+-    # for saving the masked frames or video
+-    masked_frame_for_save = []
+-    for i in range(len(frames)):
+-        mask_ = np.expand_dims(np.array(masks_dilated[i]),2).repeat(3, axis=2)/255.
+-        img = np.array(frames[i])
+-        green = np.zeros([h, w, 3]) 
+-        green[:,:,1] = 255
+-        alpha = 0.6
+-        # alpha = 1.0
+-        fuse_img = (1-alpha)*img + alpha*green
+-        fuse_img = mask_ * fuse_img + (1-mask_)*img
+-        masked_frame_for_save.append(fuse_img.astype(np.uint8))
+-
+-    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
+-    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
+-    flow_masks = to_tensors()(flow_masks).unsqueeze(0)
+-    masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
+-    frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
++    # 仅保存 PNG（不再保存 mp4）
++    masked_png_dir = os.path.join(save_root, 'masked_in_png')
++    inpaint_png_dir = os.path.join(save_root, 'inpaint_out_png')
++    os.makedirs(masked_png_dir, exist_ok=True)
++    os.makedirs(inpaint_png_dir, exist_ok=True)
++
++    video_length = len(frames)
++    if video_length < 2:
++        raise ValueError("ProPainter 至少需要 2 帧视频")
++    if args.subvideo_length < 2:
++        raise ValueError("--subvideo_length 必须至少为 2")
++    if args.neighbor_length < 2:
++        raise ValueError("--neighbor_length 必须至少为 2")
++    if args.ref_stride < 1:
++        raise ValueError("--ref_stride 必须至少为 1")
++
++    cache_np_dtype = np.float16 if use_half else np.float32
++    cache_torch_dtype = torch.float16 if use_half else torch.float32
++    cache_bytes = estimate_temporal_cache_bytes(video_length, h, w, cache_np_dtype)
+ 
+-    
+-    ##############################################
+-    # set up RAFT and flow competition model
+-    ##############################################
+-    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'raft-things.pth'), 
+-                                    model_dir='weights', progress=True, file_name=None)
+-    fix_raft = RAFT_bi(ckpt_path, device)
+-    
+-    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'recurrent_flow_completion.pth'), 
+-                                    model_dir='weights', progress=True, file_name=None)
+-    fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path)
+-    for p in fix_flow_complete.parameters():
+-        p.requires_grad = False
+-    fix_flow_complete.to(device)
+-    fix_flow_complete.eval()
+-
+-
+-    ##############################################
+-    # set up ProPainter model
+-    ##############################################
+-    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'ProPainter.pth'), 
+-                                    model_dir='weights', progress=True, file_name=None)
+-    model = InpaintGenerator(model_path=ckpt_path).to(device)
+-    model.eval()
+-
+-    
+-    ##############################################
+-    # ProPainter inference
+-    ##############################################
+-    video_length = frames.size(1)
+     print(f'\nProcessing: {video_name} [{video_length} frames]...')
+-    with torch.no_grad():
+-        # ---- compute flow ----
+-        if frames.size(-1) <= 640: 
++    with tempfile.TemporaryDirectory(prefix="propainter_temporal_") as cache_dir:
++        ensure_temporal_cache_space(cache_dir, cache_bytes)
++        print(
++            "[temporal] 使用磁盘时间片缓存: "
++            f"{cache_bytes / (1024 ** 3):.1f} GiB 预计空间，窗口 {args.subvideo_length} 帧"
++        )
++
++        source_cache = open_temporal_memmap(
++            cache_dir, "source_rgb", (video_length, h, w, 3), np.uint8
++        )
++        flow_mask_cache = open_temporal_memmap(
++            cache_dir, "flow_masks", (video_length, 1, h, w), np.uint8
++        )
++        dilated_mask_cache = open_temporal_memmap(
++            cache_dir, "dilated_masks", (video_length, 1, h, w), np.uint8
++        )
++
++        # Cache inputs once on disk and retain the existing masked-PNG output.
++        green = np.zeros([h, w, 3])
++        green[:, :, 1] = 255
++        for i in range(video_length):
++            img = np.asarray(frames[i], dtype=np.uint8)
++            flow_mask = np.asarray(flow_masks[i], dtype=np.uint8)
++            dilated_mask = np.asarray(masks_dilated[i], dtype=np.uint8)
++            source_cache[i] = img
++            flow_mask_cache[i, 0] = flow_mask
++            dilated_mask_cache[i, 0] = dilated_mask
++
++            mask_3c = np.expand_dims(dilated_mask, 2).repeat(3, axis=2) / 255.0
++            fuse_img = 0.4 * img + 0.6 * green
++            fuse_img = mask_3c * fuse_img + (1 - mask_3c) * img
++            fuse_img = cv2.resize(fuse_img.astype(np.uint8), out_size, interpolation=cv2.INTER_CUBIC)
++            cv2.imwrite(
++                os.path.join(masked_png_dir, f'{i:05d}.png'),
++                cv2.cvtColor(fuse_img, cv2.COLOR_RGB2BGR),
++            )
++        source_cache.flush()
++        flow_mask_cache.flush()
++        dilated_mask_cache.flush()
++        del frames, flow_masks, masks_dilated
++
++        flow_length = video_length - 1
++        raw_flow_f_cache = open_temporal_memmap(
++            cache_dir, "raw_flow_f", (flow_length, 2, h, w), cache_np_dtype
++        )
++        raw_flow_b_cache = open_temporal_memmap(
++            cache_dir, "raw_flow_b", (flow_length, 2, h, w), cache_np_dtype
++        )
++        pred_flow_f_cache = open_temporal_memmap(
++            cache_dir, "pred_flow_f", (flow_length, 2, h, w), cache_np_dtype
++        )
++        pred_flow_b_cache = open_temporal_memmap(
++            cache_dir, "pred_flow_b", (flow_length, 2, h, w), cache_np_dtype
++        )
++        updated_frame_cache = open_temporal_memmap(
++            cache_dir, "updated_frames", (video_length, 3, h, w), cache_np_dtype
++        )
++        updated_mask_cache = open_temporal_memmap(
++            cache_dir, "updated_masks", (video_length, 1, h, w), cache_np_dtype
++        )
++
++        ##############################################
++        # set up RAFT and flow completion model
++        ##############################################
++        ckpt_path = resolve_ckpt_path(args.weights_dir, 'raft-things.pth')
++        fix_raft = RAFT_bi(ckpt_path, device)
++
++        ckpt_path = resolve_ckpt_path(args.weights_dir, 'recurrent_flow_completion.pth')
++        fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path)
++        for p in fix_flow_complete.parameters():
++            p.requires_grad = False
++        fix_flow_complete.to(device)
++        fix_flow_complete.eval()
++
++        ##############################################
++        # set up ProPainter model
++        ##############################################
++        ckpt_path = resolve_ckpt_path(args.weights_dir, 'ProPainter.pth')
++        model = InpaintGenerator(model_path=ckpt_path).to(device)
++        model.eval()
++
++        # ---- compute flow: each RAFT result is immediately written to disk ----
++        if w <= 640:
+             short_clip_len = 12
+-        elif frames.size(-1) <= 720: 
++        elif w <= 720:
+             short_clip_len = 8
+-        elif frames.size(-1) <= 1280:
++        elif w <= 1280:
+             short_clip_len = 4
+         else:
+             short_clip_len = 2
+-        
+-        # use fp32 for RAFT
+-        if frames.size(1) > short_clip_len:
+-            gt_flows_f_list, gt_flows_b_list = [], []
+-            for f in range(0, video_length, short_clip_len):
++
++        with torch.no_grad():
++            for f in tqdm(range(0, video_length, short_clip_len), desc="RAFT flow"):
+                 end_f = min(video_length, f + short_clip_len)
+-                if f == 0:
+-                    flows_f, flows_b = fix_raft(frames[:,f:end_f], iters=args.raft_iter)
+-                else:
+-                    flows_f, flows_b = fix_raft(frames[:,f-1:end_f], iters=args.raft_iter)
+-                
+-                gt_flows_f_list.append(flows_f)
+-                gt_flows_b_list.append(flows_b)
++                start_f = 0 if f == 0 else f - 1
++                raft_frames = source_frames_to_device(source_cache, start_f, end_f, device)
++                flows_f, flows_b = fix_raft(raft_frames, iters=args.raft_iter)
++                out_start = 0 if f == 0 else f - 1
++                out_end = out_start + flows_f.size(1)
++                raw_flow_f_cache[out_start:out_end] = (
++                    flows_f[0].to(dtype=cache_torch_dtype).cpu().numpy()
++                )
++                raw_flow_b_cache[out_start:out_end] = (
++                    flows_b[0].to(dtype=cache_torch_dtype).cpu().numpy()
++                )
++                del raft_frames, flows_f, flows_b
+                 torch.cuda.empty_cache()
+-                
+-            gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
+-            gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+-            gt_flows_bi = (gt_flows_f, gt_flows_b)
+-        else:
+-            gt_flows_bi = fix_raft(frames, iters=args.raft_iter)
+-            torch.cuda.empty_cache()
+-
++        raw_flow_f_cache.flush()
++        raw_flow_b_cache.flush()
+ 
+         if use_half:
+-            frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
+-            gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+             fix_flow_complete = fix_flow_complete.half()
+             model = model.half()
+ 
+-        
+-        # ---- complete flow ----
+-        flow_length = gt_flows_bi[0].size(1)
+-        if flow_length > args.subvideo_length:
+-            pred_flows_f, pred_flows_b = [], []
+-            pad_len = 5
+-            for f in range(0, flow_length, args.subvideo_length):
+-                s_f = max(0, f - pad_len)
+-                e_f = min(flow_length, f + args.subvideo_length + pad_len)
+-                pad_len_s = max(0, f) - s_f
++        # ---- complete flow: preserve the existing 5-frame overlap ----
++        flow_pad = 5
++        with torch.no_grad():
++            for f in tqdm(range(0, flow_length, args.subvideo_length), desc="Flow completion"):
++                s_f = max(0, f - flow_pad)
++                e_f = min(flow_length, f + args.subvideo_length + flow_pad)
++                pad_len_s = f - s_f
+                 pad_len_e = e_f - min(flow_length, f + args.subvideo_length)
++                core_end = (e_f - s_f) - pad_len_e
++
++                raw_flows_f = cache_to_device(
++                    raw_flow_f_cache, slice(s_f, e_f), device, cache_torch_dtype
++                ).unsqueeze(0)
++                raw_flows_b = cache_to_device(
++                    raw_flow_b_cache, slice(s_f, e_f), device, cache_torch_dtype
++                ).unsqueeze(0)
++                flow_masks_window = masks_to_device(
++                    flow_mask_cache, slice(s_f, e_f + 1), device, cache_torch_dtype
++                )
+                 pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
+-                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]), 
+-                    flow_masks[:, s_f:e_f+1])
++                    (raw_flows_f, raw_flows_b), flow_masks_window
++                )
+                 pred_flows_bi_sub = fix_flow_complete.combine_flow(
+-                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]), 
+-                    pred_flows_bi_sub, 
+-                    flow_masks[:, s_f:e_f+1])
+-
+-                pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f-s_f-pad_len_e])
+-                pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f-s_f-pad_len_e])
++                    (raw_flows_f, raw_flows_b), pred_flows_bi_sub, flow_masks_window
++                )
++                core_length = core_end - pad_len_s
++                pred_flow_f_cache[f:f + core_length] = (
++                    pred_flows_bi_sub[0][0, pad_len_s:core_end].cpu().numpy()
++                )
++                pred_flow_b_cache[f:f + core_length] = (
++                    pred_flows_bi_sub[1][0, pad_len_s:core_end].cpu().numpy()
++                )
++                del raw_flows_f, raw_flows_b, flow_masks_window, pred_flows_bi_sub
+                 torch.cuda.empty_cache()
+-                
+-            pred_flows_f = torch.cat(pred_flows_f, dim=1)
+-            pred_flows_b = torch.cat(pred_flows_b, dim=1)
+-            pred_flows_bi = (pred_flows_f, pred_flows_b)
+-        else:
+-            pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
+-            pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
+-            torch.cuda.empty_cache()
+-            
+-
+-        # ---- image propagation ----
+-        masked_frames = frames * (1 - masks_dilated)
+-        subvideo_length_img_prop = min(100, args.subvideo_length) # ensure a minimum of 100 frames for image propagation
+-        if video_length > subvideo_length_img_prop:
+-            updated_frames, updated_masks = [], []
+-            pad_len = 10
+-            for f in range(0, video_length, subvideo_length_img_prop):
+-                s_f = max(0, f - pad_len)
+-                e_f = min(video_length, f + subvideo_length_img_prop + pad_len)
+-                pad_len_s = max(0, f) - s_f
+-                pad_len_e = e_f - min(video_length, f + subvideo_length_img_prop)
+-
+-                b, t, _, _, _ = masks_dilated[:, s_f:e_f].size()
+-                pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f-1], pred_flows_bi[1][:, s_f:e_f-1])
+-                prop_imgs_sub, updated_local_masks_sub = model.img_propagation(masked_frames[:, s_f:e_f], 
+-                                                                       pred_flows_bi_sub, 
+-                                                                       masks_dilated[:, s_f:e_f], 
+-                                                                       'nearest')
+-                updated_frames_sub = frames[:, s_f:e_f] * (1 - masks_dilated[:, s_f:e_f]) + \
+-                                    prop_imgs_sub.view(b, t, 3, h, w) * masks_dilated[:, s_f:e_f]
++        pred_flow_f_cache.flush()
++        pred_flow_b_cache.flush()
++
++        # ---- image propagation: preserve the existing 10-frame overlap ----
++        image_chunk_length = min(100, args.subvideo_length)
++        image_pad = 10
++        with torch.no_grad():
++            for f in tqdm(range(0, video_length, image_chunk_length), desc="Image propagation"):
++                s_f = max(0, f - image_pad)
++                e_f = min(video_length, f + image_chunk_length + image_pad)
++                pad_len_s = f - s_f
++                pad_len_e = e_f - min(video_length, f + image_chunk_length)
++                core_end = (e_f - s_f) - pad_len_e
++
++                frame_window = source_frames_to_device(source_cache, s_f, e_f, device)
++                frame_window = frame_window.to(dtype=cache_torch_dtype)
++                dilated_masks_window = masks_to_device(
++                    dilated_mask_cache, slice(s_f, e_f), device, cache_torch_dtype
++                )
++                pred_flows_f = cache_to_device(
++                    pred_flow_f_cache, slice(s_f, e_f - 1), device, cache_torch_dtype
++                ).unsqueeze(0)
++                pred_flows_b = cache_to_device(
++                    pred_flow_b_cache, slice(s_f, e_f - 1), device, cache_torch_dtype
++                ).unsqueeze(0)
++                b, t, _, _, _ = dilated_masks_window.size()
++                masked_frames = frame_window * (1 - dilated_masks_window)
++                prop_imgs_sub, updated_local_masks_sub = model.img_propagation(
++                    masked_frames,
++                    (pred_flows_f, pred_flows_b),
++                    dilated_masks_window,
++                    'nearest',
++                )
++                updated_frames_sub = (
++                    frame_window * (1 - dilated_masks_window)
++                    + prop_imgs_sub.view(b, t, 3, h, w) * dilated_masks_window
++                )
+                 updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
+-                
+-                updated_frames.append(updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e])
+-                updated_masks.append(updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e])
++                core_length = core_end - pad_len_s
++                updated_frame_cache[f:f + core_length] = (
++                    updated_frames_sub[0, pad_len_s:core_end].cpu().numpy()
++                )
++                updated_mask_cache[f:f + core_length] = (
++                    updated_masks_sub[0, pad_len_s:core_end].cpu().numpy()
++                )
++                del (
++                    frame_window,
++                    dilated_masks_window,
++                    pred_flows_f,
++                    pred_flows_b,
++                    masked_frames,
++                    prop_imgs_sub,
++                    updated_local_masks_sub,
++                    updated_frames_sub,
++                    updated_masks_sub,
++                )
+                 torch.cuda.empty_cache()
+-                
+-            updated_frames = torch.cat(updated_frames, dim=1)
+-            updated_masks = torch.cat(updated_masks, dim=1)
+-        else:
+-            b, t, _, _, _ = masks_dilated.size()
+-            prop_imgs, updated_local_masks = model.img_propagation(masked_frames, pred_flows_bi, masks_dilated, 'nearest')
+-            updated_frames = frames * (1 - masks_dilated) + prop_imgs.view(b, t, 3, h, w) * masks_dilated
+-            updated_masks = updated_local_masks.view(b, t, 1, h, w)
+-            torch.cuda.empty_cache()
+-            
+-    
+-    ori_frames = frames_inp
+-    comp_frames = [None] * video_length
+-
+-    neighbor_stride = args.neighbor_length // 2
+-    if video_length > args.subvideo_length:
+-        ref_num = args.subvideo_length // args.ref_stride
+-    else:
+-        ref_num = -1
+-    
+-    # ---- feature propagation + transformer ----
+-    for f in tqdm(range(0, video_length, neighbor_stride)):
+-        neighbor_ids = [
+-            i for i in range(max(0, f - neighbor_stride),
+-                                min(video_length, f + neighbor_stride + 1))
+-        ]
+-        ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
+-        selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :]
+-        selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :]
+-        selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :]
+-        selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :], pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :])
+-        
++        updated_frame_cache.flush()
++        updated_mask_cache.flush()
++
++        # Only frames that may receive another overlapping transformer result stay in RAM.
++        comp_sum = {}
++        comp_count = {}
++        target_zarr = args.zarr_rgb if args.zarr_rgb is not None else args.video
++
++        def flush_finished_frames(last_keep_idx):
++            done_ids = [idx for idx in comp_sum.keys() if idx < last_keep_idx]
++            for idx in sorted(done_ids):
++                avg = (comp_sum[idx] / max(1, comp_count[idx])).astype(np.uint8)
++                avg = cv2.resize(avg, out_size, interpolation=cv2.INTER_CUBIC)
++                cv2.imwrite(
++                    os.path.join(inpaint_png_dir, f'{idx:05d}.png'),
++                    cv2.cvtColor(avg, cv2.COLOR_RGB2BGR),
++                )
++                if args.rewrite_zarr:
++                    mask_for_rewrite = cv2.resize(
++                        dilated_mask_cache[idx, 0],
++                        out_size,
++                        interpolation=cv2.INTER_NEAREST,
++                    )
++                    write_frame_back_to_zarr(
++                        target_zarr,
++                        frame_idx=idx,
++                        rgb_frame=avg,
++                        mask_frame=(mask_for_rewrite > 0).astype(np.uint8),
++                        rgb_key=args.rewrite_rgb_key,
++                        mask_key=args.rewrite_mask_key,
++                        overwrite_rgb=args.overwrite_rgb,
++                    )
++                del comp_sum[idx]
++                del comp_count[idx]
++
++        neighbor_stride = args.neighbor_length // 2
++        ref_num = args.subvideo_length // args.ref_stride if video_length > args.subvideo_length else -1
++
++        # ---- feature propagation + transformer: gather only current local/reference frames ----
+         with torch.no_grad():
+-            # 1.0 indicates mask
+-            l_t = len(neighbor_ids)
+-            
+-            # pred_img = selected_imgs # results of image propagation
+-            pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t)
+-            
+-            pred_img = pred_img.view(-1, 3, h, w)
+-
+-            pred_img = (pred_img + 1) / 2
+-            pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
+-            binary_masks = masks_dilated[0, neighbor_ids, :, :, :].cpu().permute(
+-                0, 2, 3, 1).numpy().astype(np.uint8)
+-            for i in range(len(neighbor_ids)):
+-                idx = neighbor_ids[i]
+-                img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
+-                    + ori_frames[idx] * (1 - binary_masks[i])
+-                if comp_frames[idx] is None:
+-                    comp_frames[idx] = img
+-                else: 
+-                    comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+-                    
+-                comp_frames[idx] = comp_frames[idx].astype(np.uint8)
+-        
++            for f in tqdm(range(0, video_length, neighbor_stride), desc="Transformer"):
++                neighbor_ids = list(range(
++                    max(0, f - neighbor_stride),
++                    min(video_length, f + neighbor_stride + 1),
++                ))
++                ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
++                selected_ids = neighbor_ids + ref_ids
++                flow_ids = neighbor_ids[:-1]
++
++                selected_imgs = cache_to_device(
++                    updated_frame_cache, selected_ids, device, cache_torch_dtype
++                ).unsqueeze(0)
++                selected_masks = masks_to_device(
++                    dilated_mask_cache, selected_ids, device, cache_torch_dtype
++                )
++                selected_update_masks = cache_to_device(
++                    updated_mask_cache, selected_ids, device, cache_torch_dtype
++                ).unsqueeze(0)
++                selected_pred_flows_bi = (
++                    cache_to_device(pred_flow_f_cache, flow_ids, device, cache_torch_dtype).unsqueeze(0),
++                    cache_to_device(pred_flow_b_cache, flow_ids, device, cache_torch_dtype).unsqueeze(0),
++                )
++                pred_img = model(
++                    selected_imgs,
++                    selected_pred_flows_bi,
++                    selected_masks,
++                    selected_update_masks,
++                    len(neighbor_ids),
++                )
++                pred_img = (pred_img.view(-1, 3, h, w) + 1) / 2
++                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
++                binary_masks = (
++                    np.asarray(dilated_mask_cache[neighbor_ids, 0]) > 0
++                ).astype(np.uint8)[..., None]
++                for i, idx in enumerate(neighbor_ids):
++                    img = (
++                        np.asarray(pred_img[i]).astype(np.uint8) * binary_masks[i]
++                        + np.asarray(source_cache[idx]) * (1 - binary_masks[i])
++                    )
++                    if idx not in comp_sum:
++                        comp_sum[idx] = img.astype(np.float32)
++                        comp_count[idx] = 1
++                    else:
++                        comp_sum[idx] += img.astype(np.float32)
++                        comp_count[idx] += 1
++
++                del pred_img, binary_masks, selected_imgs, selected_masks, selected_update_masks, selected_pred_flows_bi
++                flush_finished_frames(max(0, f - neighbor_stride))
++                torch.cuda.empty_cache()
++
++        flush_finished_frames(video_length + 1)
++        del fix_raft, fix_flow_complete, model
+         torch.cuda.empty_cache()
+-                
+-    # save each frame
+-    if args.save_frames:
+-        for idx in range(video_length):
+-            f = comp_frames[idx]
+-            f = cv2.resize(f, out_size, interpolation = cv2.INTER_CUBIC)
+-            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+-            img_save_root = os.path.join(save_root, 'frames', str(idx).zfill(4)+'.png')
+-            imwrite(f, img_save_root)
+-                    
+-
+-    # if args.mode == 'video_outpainting':
+-    #     comp_frames = [i[10:-10,10:-10] for i in comp_frames]
+-    #     masked_frame_for_save = [i[10:-10,10:-10] for i in masked_frame_for_save]
+-    
+-    # save videos frame
+-    masked_frame_for_save = [cv2.resize(f, out_size) for f in masked_frame_for_save]
+-    comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
+-    imageio.mimwrite(os.path.join(save_root, 'masked_in.mp4'), masked_frame_for_save, fps=fps, quality=7)
+-    imageio.mimwrite(os.path.join(save_root, 'inpaint_out.mp4'), comp_frames, fps=fps, quality=7)
+     
+     print(f'\nAll results are saved in {save_root}')
++    print(f'  - masked png: {masked_png_dir}')
++    print(f'  - inpaint png: {inpaint_png_dir}')
++    if args.rewrite_zarr:
++        target_zarr = args.zarr_rgb if args.zarr_rgb is not None else args.video
++        print(f'  - rewritten zarr: {target_zarr}')
+     
+-    torch.cuda.empty_cache()
+\ No newline at end of file
++    torch.cuda.empty_cache()

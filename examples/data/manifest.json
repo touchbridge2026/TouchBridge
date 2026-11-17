@@ -1,0 +1,20 @@
+{
+  "task": "Screwing a light bulb",
+  "archive": "screw_bulb.zarr.zip",
+  "sha256": "ab1e7f2517a85d0944f1f4c3237c92ea21f6228c2c757a075c783dc526105823",
+  "frames": 115,
+  "width": 320,
+  "height": 240,
+  "nominal_fps": 5,
+  "duration_seconds": 22.805964946746826,
+  "tactile_samples": {
+    "left": 2079,
+    "right": 2079
+  },
+  "source_visual_frames": 686,
+  "visual_frame_stride": 6,
+  "image_scale": 0.5,
+  "wrist_rgb_included": false,
+  "calibration": "base_in_scene_tag.json",
+  "size_bytes": 48052194
+}

@@ -1,0 +1,16 @@
+-r requirements.txt
+# Install the matching torch/torchvision CUDA wheels first (see README).
+torch>=2.5.1
+torchvision>=0.20
+einops
+psutil
+pycocotools
+decord
+scikit-image
+scikit-learn
+av
+addict
+future
+requests
+timm>=1.0.17
+yapf
